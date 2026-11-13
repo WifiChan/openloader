@@ -9,10 +9,12 @@ use crate::{
 use simpleport::{SimpleRead, SimpleWrite};
 
 const SYNC_FLAG: u8 = 0x5a;
+const WRITE32_FLAG: u8 = 0x6a;
 const DOWNLOAD_FLAG: u8 = 0x7a;
 const RUN_FLAG: u8 = 0x8a;
 
 const SYNC_ACK: u8 = 0xa5;
+const WRITE32_ACK: u8 = 0xa6;
 const DOWNLOAD_HEADER_ACK: u8 = 0xa1;
 const DOWNLOAD_COMPLETE_ACK: u8 = 0xa7;
 const RUN_ACK: u8 = 0xa8;
@@ -29,31 +31,90 @@ pub struct ZteProtocol {
 impl ZteProtocol {
     pub unsafe fn dispatch(&mut self) -> Result<(), Error> {
         loop {
-            let cmd = self.usb.read_u8()?;
+            // Check UART Serial first
+            if !unsafe { Serial::rx_empty() } {
+                let cmd = unsafe { Serial::raw_getc() };
+                match cmd {
+                    SYNC_FLAG => Serial::putc(SYNC_ACK),
+                    WRITE32_FLAG => unsafe {
+                        let mut addr_bytes = [0u8; 4];
+                        for b in &mut addr_bytes { *b = Serial::raw_getc(); }
+                        let addr = u32::from_be_bytes(addr_bytes);
 
-            match cmd {
-                SYNC_FLAG => self.usb.write_u8(SYNC_ACK)?,
-                DOWNLOAD_FLAG => unsafe {
-                    let addr = self.usb.read_u32_be()?;
-                    let size = self.usb.read_u32_be()?;
+                        let mut value_bytes = [0u8; 4];
+                        for b in &mut value_bytes { *b = Serial::raw_getc(); }
+                        let value = u32::from_be_bytes(value_bytes);
 
-                    self.usb.write_u8(DOWNLOAD_HEADER_ACK)?;
+                        if addr != 0 {
+                            writel(addr as usize, value as usize);
+                        } else {
+                            Serial::putc(WRITE32_ACK);
+                        }
+                    },
+                    DOWNLOAD_FLAG => unsafe {
+                        let mut addr_bytes = [0u8; 4];
+                        for b in &mut addr_bytes { *b = Serial::raw_getc(); }
+                        let addr = u32::from_be_bytes(addr_bytes);
 
-                    self.usb
-                        .read(slice::from_raw_parts_mut(addr as *mut u8, size as usize))?;
+                        let mut size_bytes = [0u8; 4];
+                        for b in &mut size_bytes { *b = Serial::raw_getc(); }
+                        let size = u32::from_be_bytes(size_bytes);
 
-                    self.usb.write_u8(DOWNLOAD_COMPLETE_ACK)?;
-                },
-                RUN_FLAG => unsafe {
-                    let addr = self.usb.read_u32_be()?;
-                    Self::boot_ap(addr as usize);
+                        Serial::putc(DOWNLOAD_HEADER_ACK);
 
-                    self.usb.write_u8(RUN_ACK)?;
+                        let buf = slice::from_raw_parts_mut(addr as *mut u8, size as usize);
+                        for b in buf { *b = Serial::raw_getc(); }
 
-                    break Ok(());
-                },
-                _ => {
-                    uwriteln!(&mut Serial, "Unknown command: {:#x}", cmd);
+                        Serial::putc(DOWNLOAD_COMPLETE_ACK);
+                    },
+                    RUN_FLAG => unsafe {
+                        let mut addr_bytes = [0u8; 4];
+                        for b in &mut addr_bytes { *b = Serial::raw_getc(); }
+                        let addr = u32::from_be_bytes(addr_bytes);
+
+                        Self::boot_ap(addr as usize);
+                        Serial::putc(RUN_ACK);
+                        break Ok(());
+                    },
+                    _ => {}
+                }
+            }
+
+            // Also check USB
+            let cmd = self.usb.read_u8();
+            if let Ok(cmd) = cmd {
+                match cmd {
+                    SYNC_FLAG => self.usb.write_u8(SYNC_ACK)?,
+                    WRITE32_FLAG => unsafe {
+                        let addr = self.usb.read_u32_be()?;
+                        let value = self.usb.read_u32_be()?;
+
+                        if addr != 0 {
+                            writel(addr as usize, value as usize);
+                        } else {
+                            self.usb.write_u8(WRITE32_ACK)?;
+                        }
+                    },
+                    DOWNLOAD_FLAG => unsafe {
+                        let addr = self.usb.read_u32_be()?;
+                        let size = self.usb.read_u32_be()?;
+
+                        self.usb.write_u8(DOWNLOAD_HEADER_ACK)?;
+
+                        self.usb
+                            .read(slice::from_raw_parts_mut(addr as *mut u8, size as usize))?;
+
+                        self.usb.write_u8(DOWNLOAD_COMPLETE_ACK)?;
+                    },
+                    RUN_FLAG => unsafe {
+                        let addr = self.usb.read_u32_be()?;
+                        Self::boot_ap(addr as usize);
+
+                        self.usb.write_u8(RUN_ACK)?;
+
+                        break Ok(());
+                    },
+                    _ => {}
                 }
             }
         }

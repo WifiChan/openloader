@@ -5,7 +5,7 @@ use crate::drivers::{StatelessDriver, bit, readl, writel};
 const UART_CLOCK: usize = 26000000;
 const UART_BAUD: usize = 115200;
 
-const UART1_BASE: usize = 0x01408000;
+const UART1_BASE: usize = 0x1407000;
 const UART_DR: usize = UART1_BASE + 0x04;
 const UART_FR: usize = UART1_BASE + 0x14;
 const UART_IBRD: usize = UART1_BASE + 0x24;
@@ -17,6 +17,7 @@ const UART_ICR: usize = UART1_BASE + 0x4c;
 
 const FLAG_ENABLE: usize = bit(0);
 const FLAG_TX_ENABLE: usize = bit(8);
+const FLAG_RX_ENABLE: usize = bit(9);
 
 const FLAG_BREAK: usize = bit(0);
 const FLAG_PARITY: usize = bit(1);
@@ -25,6 +26,7 @@ const FLAG_FIFO: usize = bit(4);
 const FLAG_TX_8BITS: usize = 3 << 5;
 
 const FLAG_BUSY: usize = bit(8);
+const FLAG_RXFE: usize = bit(4);
 
 pub struct Serial;
 
@@ -41,6 +43,15 @@ impl Serial {
             Self::raw_putc(b'\r');
         }
         Self::raw_putc(c);
+    }
+
+    pub unsafe fn rx_empty() -> bool {
+        (unsafe { readl(UART_FR) } & FLAG_RXFE) != 0
+    }
+
+    pub unsafe fn raw_getc() -> u8 {
+        while unsafe { Self::rx_empty() } {}
+        (unsafe { readl(UART_DR) } & 0xff) as u8
     }
 
     #[inline(always)]
@@ -78,7 +89,7 @@ impl StatelessDriver for Serial {
 
             // Stop
             writel(UART_ICR, 0xffff);
-            writel(UART_CR, !(FLAG_ENABLE | FLAG_TX_ENABLE));
+            writel(UART_CR, !(FLAG_ENABLE | FLAG_TX_ENABLE | FLAG_RX_ENABLE));
 
             // Set baud
             Self::setbrg();
@@ -92,7 +103,7 @@ impl StatelessDriver for Serial {
             // Disable interrupts
             writel(UART_IMSC, 0);
 
-            writel(UART_CR, FLAG_ENABLE | FLAG_TX_ENABLE);
+            writel(UART_CR, FLAG_ENABLE | FLAG_TX_ENABLE | FLAG_RX_ENABLE);
 
             Self
         }

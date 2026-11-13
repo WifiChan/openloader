@@ -1,6 +1,8 @@
 use simpleport::{SimpleRead, SimpleWrite};
 use ufmt::uwriteln;
 
+use crate::drivers::delay::nsdelay;
+use crate::drivers::{readl, writel};
 use crate::drivers::DriverMut;
 use crate::drivers::regs::register;
 use crate::drivers::uart::Serial;
@@ -8,7 +10,138 @@ use crate::err::USBError;
 
 const TYPE_BULK: usize = 2;
 
-const USB_BASE: usize = 0x01500000;
+// DWC OTG device-mode controller base. The original tloader selects this at
+// runtime from [0x13B004] & 3: high-speed -> 0x1600000, full-speed -> 0x1500000.
+// The extracted config descriptor uses MPS=512 (high speed), so default to the
+// high-speed base. If the device negotiates full speed, flip this to 0x01500000.
+const USB_BASE: usize = 0x01600000;
+
+// ZX297520V3 USB PHY registers (reverse engineered from sub_83688).
+const USB_PHY_STATUS: usize = 0x13B004;
+const USB_PHY_0X14010C: usize = 0x14010C;
+const USB_PHY_0X140110: usize = 0x140110;
+const USB_PHY_0X140114: usize = 0x140114;
+const USB_PHY_0X13B06C: usize = 0x13B06C;
+const USB_PHY_0X13B080: usize = 0x13B080;
+const USB_PHY_0X13B084: usize = 0x13B084;
+
+/// Read the current USB speed. 2 == high speed, otherwise full speed.
+unsafe fn usb_speed() -> usize {
+    (unsafe { readl(USB_PHY_STATUS) }) & 3
+}
+
+/// Busy-wait delay used by the PHY init sequence. sub_8545C(ticks) waits
+/// `ticks * 0xD0` hardware timer counts; we approximate with a NOP loop.
+unsafe fn phy_delay(ticks: usize) {
+    unsafe { nsdelay((ticks * 0x1000) as u32) };
+}
+
+/// Translate the original tloader's USB PHY init (sub_83688). Two paths exist
+/// and the original picks them via [dword_879FC + 0x14]; here we key off the
+/// live speed register directly.
+unsafe fn usb_phy_init() {
+    let high_speed = unsafe { usb_speed() } == 2;
+
+    if high_speed {
+        // High-speed path: bit9 on 0x14010x, bits2/1/0 on 0x13B06C/0x13B080,
+        // then poll 0x13B084 bit0 until set.
+        unsafe {
+            writel(USB_PHY_0X140110, readl(USB_PHY_0X140110) | 0x200);
+            phy_delay(0xA);
+            writel(USB_PHY_0X14010C, readl(USB_PHY_0X14010C) | 0x200);
+            phy_delay(0xA);
+            writel(USB_PHY_0X140114, readl(USB_PHY_0X140114) & !0x200);
+            phy_delay(0xA);
+            writel(USB_PHY_0X140114, readl(USB_PHY_0X140114) | 0x200);
+            phy_delay(0xA);
+            writel(USB_PHY_0X14010C, readl(USB_PHY_0X14010C) & !0x200);
+            phy_delay(0xA);
+            writel(USB_PHY_0X140110, readl(USB_PHY_0X140110) & !0x200);
+            phy_delay(0xA);
+
+            writel(USB_PHY_0X13B06C, readl(USB_PHY_0X13B06C) & !4);
+            phy_delay(0x14);
+            writel(USB_PHY_0X13B06C, readl(USB_PHY_0X13B06C) | 4);
+            writel(USB_PHY_0X13B06C, readl(USB_PHY_0X13B06C) & !2);
+            phy_delay(0x14);
+            writel(USB_PHY_0X13B06C, readl(USB_PHY_0X13B06C) | 2);
+            writel(USB_PHY_0X13B06C, readl(USB_PHY_0X13B06C) & !1);
+            phy_delay(0x14);
+            writel(USB_PHY_0X13B06C, readl(USB_PHY_0X13B06C) | 1);
+            writel(USB_PHY_0X13B080, readl(USB_PHY_0X13B080) & !4);
+            phy_delay(0x14);
+
+            writel(USB_PHY_0X13B080, readl(USB_PHY_0X13B080) | 4);
+            phy_delay(0xA);
+            writel(USB_PHY_0X13B080, readl(USB_PHY_0X13B080) & !2);
+            phy_delay(0x14);
+            writel(USB_PHY_0X13B080, readl(USB_PHY_0X13B080) | 2);
+            writel(USB_PHY_0X13B080, readl(USB_PHY_0X13B080) & !1);
+            phy_delay(0x14);
+            writel(USB_PHY_0X13B080, readl(USB_PHY_0X13B080) | 1);
+            phy_delay(0x64);
+
+            let mut timeout = 0xC351usize;
+            loop {
+                if readl(USB_PHY_0X13B084) & 1 != 0 {
+                    break;
+                }
+                timeout -= 1;
+                if timeout == 0 {
+                    break;
+                }
+                phy_delay(0x14);
+            }
+        }
+    } else {
+        // Full-speed path: bit8 on 0x14010x, bits4/3 on 0x13B06C,
+        // bits5/4/3 on 0x13B080, then poll 0x13B084 bit1 until set.
+        unsafe {
+            writel(USB_PHY_0X140110, readl(USB_PHY_0X140110) | 0x100);
+            phy_delay(0xA);
+            writel(USB_PHY_0X14010C, readl(USB_PHY_0X14010C) | 0x100);
+            phy_delay(0xA);
+            writel(USB_PHY_0X140114, readl(USB_PHY_0X140114) & !0x100);
+            phy_delay(0xA);
+            writel(USB_PHY_0X140114, readl(USB_PHY_0X140114) | 0x100);
+            phy_delay(0xA);
+            writel(USB_PHY_0X14010C, readl(USB_PHY_0X14010C) & !0x100);
+            phy_delay(0xA);
+            writel(USB_PHY_0X140110, readl(USB_PHY_0X140110) & !0x100);
+            phy_delay(0xA);
+
+            writel(USB_PHY_0X13B06C, readl(USB_PHY_0X13B06C) & !0x10);
+            phy_delay(0x14);
+            writel(USB_PHY_0X13B06C, readl(USB_PHY_0X13B06C) | 0x10);
+            writel(USB_PHY_0X13B06C, readl(USB_PHY_0X13B06C) & !8);
+            phy_delay(0x14);
+            writel(USB_PHY_0X13B06C, readl(USB_PHY_0X13B06C) | 8);
+            phy_delay(0x64);
+            writel(USB_PHY_0X13B080, readl(USB_PHY_0X13B080) & !0x20);
+            phy_delay(0x64);
+            writel(USB_PHY_0X13B080, readl(USB_PHY_0X13B080) | 0x20);
+            writel(USB_PHY_0X13B080, readl(USB_PHY_0X13B080) & !0x10);
+            phy_delay(0x64);
+            writel(USB_PHY_0X13B080, readl(USB_PHY_0X13B080) | 0x10);
+            writel(USB_PHY_0X13B080, readl(USB_PHY_0X13B080) & !8);
+            phy_delay(0x64);
+            writel(USB_PHY_0X13B080, readl(USB_PHY_0X13B080) | 8);
+            phy_delay(0x64);
+
+            let mut timeout = 0xC351usize;
+            loop {
+                if readl(USB_PHY_0X13B084) & 2 != 0 {
+                    break;
+                }
+                timeout -= 1;
+                if timeout == 0 {
+                    break;
+                }
+                phy_delay(0x14);
+            }
+        }
+    }
+}
 
 register!(gahbcfg, USB_BASE + 0x008, [
     bit: NPTXFEMPLVL, offset: 5, width: 1;
@@ -77,17 +210,17 @@ pub struct Usb {
 impl DriverMut for Usb {
     unsafe fn init(&mut self) {
         unsafe {
-            gahbcfg::read_modify_write(|r| {
-                use gahbcfg::*;
-
-                if r.is_set_bit(NPTXFEMPLVL) {
-                    r.clear_bit(NPTXFEMPLVL);
-                }
-            });
-
-            dctl::read_modify_write(|r| {
-                r.set_bit(dctl::SOFT_RESET1).set_bit(dctl::SOFT_RESET2);
-            });
+            // MINIMAL-INTERVENTION: the BootROM has already initialized the USB
+            // PHY and enumerated the USB CDC device. We must NOT touch the PHY
+            // (usb_phy_init) or reprogram the DWC OTG controller registers
+            // (gahbcfg/soft-reset/EP config) because that tears down the
+            // existing link and we have no re-enumeration logic. Only read the
+            // negotiated speed (safe) and reuse the BootROM's EP1 setup as-is.
+            //
+            // usb_phy_init();
+            // gahbcfg::read_modify_write(...);
+            // dctl soft reset removed;
+            // doepctl1/diepctl1/doeptsiz1 config removed;
 
             let speed = (dsts::read() >> 1) & 0x3;
 
@@ -101,32 +234,6 @@ impl DriverMut for Usb {
                 uwriteln!(&mut Serial, "USB: Using USB Full Speed Mode (MPS=64 bytes)");
                 64
             };
-
-            doeptsiz1::read_modify_write(|r| {
-                use doeptsiz1::*;
-
-                r.set_bit(PKTCNT).set_field(SPEED, speed);
-            });
-
-            doepctl1::new_scope(|r| {
-                use doepctl1::*;
-
-                r.set_bit(EPENA)
-                    .set_bit(CNAK)
-                    .set_field(EP_TYPE, 2)
-                    .set_bit(USB_ACTIVE_EP)
-                    .set_field(MPS, self.ep_mps);
-            });
-
-            diepctl1::new_scope(|r| {
-                use diepctl1::*;
-
-                r.set_bit(CNAK)
-                    .set_field(TXFNUM, 1)
-                    .set_field(EP_TYPE, 2)
-                    .set_bit(USB_ACTIVE_EP)
-                    .set_field(MPS, self.ep_mps);
-            });
         }
     }
 }
@@ -203,10 +310,7 @@ impl Usb {
                 }
             }
 
-            hang_ctr += 1;
-            if hang_ctr > 1_000_000 {
-                break Err(USBError::Timeout);
-            }
+            // Don't time out while waiting for USB host commands
         }
     }
 

@@ -9,6 +9,7 @@ pub(super) mod regs;
 pub mod uart;
 pub mod usb;
 pub mod zte_protocol;
+pub mod spi;
 
 pub trait StatelessDriver {
     unsafe fn init() -> Self;
